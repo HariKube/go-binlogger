@@ -120,7 +120,7 @@ Creates a snapshot at the current index and returns:
 - `release`: Callback to release snapshot and allow cleanup of old WAL files
 - `err`: Error if snapshot creation fails
 
-**Important**: Call `release()` after successfully processing the entries to allow WAL to delete old segment files.
+**Important**: Call `release(ok)` after successfully processing the entries to allow WAL to delete old segment files.
 
 ```go
 func (bl *BinLogger) MustCreateSnapshot() (prevIndex uint64, currentIndex uint64, entries []raftpb.Entry, release func() error)
