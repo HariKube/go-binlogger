@@ -146,23 +146,30 @@ if err != nil {
 }
 
 // Process entries
+var err error
 for _, entry := range entries {
-    if err := processEntry(entry); err != nil {
-        log.Fatalf("Failed to process entry: %v", err)
+    if err = processEntry(entry); err != nil {
+        break
     }
 }
 
 // Release lock after successful processing
-if err := release(); err != nil {
+if err := release(err != nil); err != nil {
     log.Fatalf("Failed to release lock: %v", err)
 }
 
 // Or with Must variant (panics on error)
 prevIdx, currIdx, entries, release := logger.MustCreateSnapshot()
+
+// Process entries
+var err error
 for _, entry := range entries {
-    processEntry(entry)  // panic on error
+    if err = processEntry(entry); err != nil {
+        break
+    }
 }
-release()  // panic on error
+
+release(err != nil)  // panic on error
 ```
 
 ## How Snapshots Work
