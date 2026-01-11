@@ -276,8 +276,10 @@ func (bl *BinLogger) MustCreateSnapshot() (uint64, uint64, []raftpb.Entry, func(
 	}
 
 	return prevSnapshot, snapshot, entries, func(ok bool) error {
-		if err := release(ok); err != nil {
-			panic(fmt.Errorf("failed to release lock to %s (%d - %d): %v", bl.snapDir, prevSnapshot, snapshot, err))
+		if release != nil {
+			if err := release(ok); err != nil {
+				panic(fmt.Errorf("failed to release lock to %s (%d - %d): %v", bl.snapDir, prevSnapshot, snapshot, err))
+			}
 		}
 
 		return nil
