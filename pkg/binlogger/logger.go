@@ -213,11 +213,6 @@ func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool
 		bl.logMutex.Unlock()
 		return 0, 0, nil, nil, err
 	}
-	defer func() {
-		if err := w.Close(); err != nil {
-			fmt.Printf("failed to close wal reader: %v", err)
-		}
-	}()
 
 	_, _, ents, err := w.ReadAll()
 	if err != nil {
