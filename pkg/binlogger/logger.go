@@ -3,7 +3,6 @@ package gobinlogger
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -28,9 +27,9 @@ var (
 type BinLogger struct {
 	walDir        string
 	snapDir       string
-	index         atomic.Uint64
-	lastSnapIndex atomic.Uint64
 	logMutex      sync.Mutex
+	lastIndex     atomic.Uint64
+	lastSnapIndex atomic.Uint64
 	snapshotter   *snap.Snapshotter
 	syncInterval  time.Duration
 	storage       storage.Storage
@@ -75,7 +74,7 @@ func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 			Index: index,
 		}
 
-		bl.index.Store(index)
+		bl.lastIndex.Store(index)
 		bl.lastSnapIndex.Store(index)
 
 		w, err = wal.Open(zap.NewNop(), bl.walDir, walSnap)
@@ -89,7 +88,7 @@ func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 		}
 
 		if len(ents) > 0 {
-			bl.index.Store(ents[len(ents)-1].Index)
+			bl.lastIndex.Store(ents[len(ents)-1].Index)
 		}
 	} else {
 		w, err = wal.Create(zap.NewNop(), bl.walDir, nil)
@@ -142,24 +141,13 @@ func (bl *BinLogger) MustStart(ctx context.Context, wg ...*sync.WaitGroup) {
 }
 
 func (bl *BinLogger) Log(data [][]byte) error {
-	var currentIndex uint64
-	for {
-		currentIndex = bl.index.Load()
-		if math.MaxUint64-currentIndex < uint64(len(data)) {
-			return ErrIndexOverflow
-		}
-
-		newIndex := currentIndex + uint64(len(data))
-		if bl.index.CompareAndSwap(currentIndex, newIndex) {
-			break
-		}
-	}
+	bl.logMutex.Lock()
+	defer bl.logMutex.Unlock()
 
 	entries := make([]raftpb.Entry, len(data))
 	for i := range data {
-		currentIndex++
 		entries[i] = raftpb.Entry{
-			Index: currentIndex,
+			Index: bl.lastIndex.Add(1),
 			Type:  raftpb.EntryNormal,
 			Data:  data[i],
 		}
@@ -199,10 +187,10 @@ func (bl *BinLogger) Close() error {
 func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool) error, error) {
 	bl.logMutex.Lock()
 
+	lastIndex := bl.lastIndex.Load()
 	prevSnapIndex := bl.lastSnapIndex.Load()
-	currentIndex := bl.index.Load()
 
-	if prevSnapIndex >= currentIndex {
+	if prevSnapIndex >= lastIndex {
 		bl.logMutex.Unlock()
 		return 0, 0, nil, nil, nil
 	}
@@ -221,7 +209,7 @@ func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool
 	}
 
 	walSnapshot := walpb.Snapshot{
-		Index: currentIndex,
+		Index: lastIndex,
 	}
 
 	var filtered []raftpb.Entry
