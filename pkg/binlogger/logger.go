@@ -25,13 +25,15 @@ var (
 )
 
 type BinLogger struct {
-	walDir        string
-	snapDir       string
+	walDir       string
+	snapDir      string
+	syncInterval time.Duration
+
 	logMutex      sync.Mutex
 	lastIndex     atomic.Uint64
+	snapshotMutex sync.Mutex
 	lastSnapIndex atomic.Uint64
 	snapshotter   *snap.Snapshotter
-	syncInterval  time.Duration
 	storage       storage.Storage
 }
 
@@ -185,26 +187,26 @@ func (bl *BinLogger) Close() error {
 }
 
 func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool) error, error) {
-	bl.logMutex.Lock()
+	bl.snapshotMutex.Lock()
 
 	lastIndex := bl.lastIndex.Load()
 	prevSnapIndex := bl.lastSnapIndex.Load()
 
 	if prevSnapIndex >= lastIndex {
-		bl.logMutex.Unlock()
+		bl.snapshotMutex.Unlock()
 		return 0, 0, nil, nil, nil
 	}
 
 	prevWalSnapshot := walpb.Snapshot{Index: prevSnapIndex}
 	w, err := wal.OpenForRead(zap.NewNop(), bl.walDir, prevWalSnapshot)
 	if err != nil {
-		bl.logMutex.Unlock()
+		bl.snapshotMutex.Unlock()
 		return 0, 0, nil, nil, err
 	}
 
 	_, _, ents, err := w.ReadAll()
 	if err != nil {
-		bl.logMutex.Unlock()
+		bl.snapshotMutex.Unlock()
 		return 0, 0, nil, nil, err
 	}
 
@@ -227,20 +229,20 @@ func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool
 	}
 
 	if err := bl.storage.SaveSnap(snashot); err != nil {
-		bl.logMutex.Unlock()
+		bl.snapshotMutex.Unlock()
 		return 0, 0, nil, nil, fmt.Errorf("failed to save raft snapshot to %s (%d - %d): %v", bl.snapDir, prevWalSnapshot.Index, walSnapshot.Index, err)
 	}
 	bl.lastSnapIndex.Store(walSnapshot.Index)
 
 	if bl.syncInterval == 0 {
 		if err := bl.storage.Sync(); err != nil {
-			bl.logMutex.Unlock()
+			bl.snapshotMutex.Unlock()
 			return 0, 0, nil, nil, fmt.Errorf("failed to sync WAL after snapshot: %v", err)
 		}
 	}
 
 	releaseFn := func(ok bool) error {
-		defer bl.logMutex.Unlock()
+		defer bl.snapshotMutex.Unlock()
 
 		if ok {
 			return bl.storage.Release(snashot)
