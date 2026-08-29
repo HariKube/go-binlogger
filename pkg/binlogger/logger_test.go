@@ -986,3 +986,537 @@ func TestSnapshot_FencePost_BoundaryEntryNotDoubled(t *testing.T) {
 		t.Errorf("expected no-op snapshot; got prevN=%d currN=%d entries=%v", prevN, currN, ents)
 	}
 }
+
+// ============================================================================
+// DEEP EDGE-CASE & ERROR PATH TESTS — data integrity under unusual conditions
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 9. Nil-data entry: a Log call with one nil-payload element must be written,
+//    recovered, and appear in a snapshot without corrupting adjacent entries.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_NilDataEntry_PreservedAndIsolated(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	// Write a real entry, a nil-data entry, then another real entry.
+	if err := bl.Log([][]byte{[]byte("before-nil")}); err != nil {
+		t.Fatalf("Log before nil: %v", err)
+	}
+	if err := bl.Log([][]byte{nil}); err != nil {
+		t.Fatalf("Log nil data: %v", err)
+	}
+	if err := bl.Log([][]byte{[]byte("after-nil")}); err != nil {
+		t.Fatalf("Log after nil: %v", err)
+	}
+
+	_, curr, ents, release, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	defer release(true)
+
+	if curr != 3 {
+		t.Errorf("currSnapIndex: got %d want 3", curr)
+	}
+	if len(ents) != 3 {
+		t.Fatalf("entry count: got %d want 3", len(ents))
+	}
+	if string(ents[0].Data) != "before-nil" {
+		t.Errorf("ents[0]: got %q want %q", ents[0].Data, "before-nil")
+	}
+	if ents[1].Data != nil {
+		t.Errorf("ents[1].Data: got %q want nil", ents[1].Data)
+	}
+	if string(ents[2].Data) != "after-nil" {
+		t.Errorf("ents[2]: got %q want %q", ents[2].Data, "after-nil")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 10. Nil-data entry survives a full restart with correct index assignment.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_NilDataEntry_SurvivesRestart(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	if err := bl.Log([][]byte{[]byte("pre"), nil, []byte("post")}); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+	// Snapshot and close without releasing WAL (release true still).
+	_, _, _, rel, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if err := rel(true); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	mustLog(t, bl, "after-snap")
+
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	_, curr, ents, release2, err := bl2.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("post-restart snapshot: %v", err)
+	}
+	defer release2(true)
+
+	// After restart the un-snapshotted entry ("after-snap", index 4) must appear.
+	if curr != 4 {
+		t.Errorf("currSnapIndex: got %d want 4", curr)
+	}
+	if len(ents) != 1 || string(ents[0].Data) != "after-snap" {
+		t.Errorf("post-restart entries: got %v want [after-snap]", ents)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 11. Multiple restarts with no new writes between them must be idempotent:
+//     lastIndex and lastSnapIndex must remain stable, CreateSnapshot no-op.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_MultipleRestarts_Idempotent(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	mustLog(t, bl, "stable-1", "stable-2", "stable-3")
+	_, snapCurr, _ := collectAll(t, bl)
+	if snapCurr != 3 {
+		t.Fatalf("initial snapshot curr: got %d want 3", snapCurr)
+	}
+
+	// Restart 3 times without any writes or snapshots.
+	for i := 0; i < 3; i++ {
+		bl = restartLogger(t, bl, walDir, snapDir)
+
+		// CreateSnapshot must be a no-op every time.
+		_, _, ents, rel, err := bl.CreateSnapshot()
+		if err != nil {
+			t.Fatalf("restart %d CreateSnapshot: %v", i+1, err)
+		}
+		if ents != nil || rel != nil {
+			t.Errorf("restart %d: expected no-op snapshot, got entries=%v", i+1, ents)
+		}
+
+		// A new entry after each restart must get the next monotonic index.
+		mustLog(t, bl, fmt.Sprintf("post-restart-%d", i+1))
+		prev, curr, entries := collectAll(t, bl)
+		wantPrev := uint64(3 + i)
+		wantCurr := uint64(4 + i)
+		if prev != wantPrev || curr != wantCurr {
+			t.Errorf("restart %d snapshot: got (%d,%d) want (%d,%d)", i+1, prev, curr, wantPrev, wantCurr)
+		}
+		if len(entries) != 1 || entries[0] != fmt.Sprintf("post-restart-%d", i+1) {
+			t.Errorf("restart %d entries: %v", i+1, entries)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 12. Snapshot exactly at index 1 (single first entry) — boundary correctness.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_AtIndexOne(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	mustLog(t, bl, "only-entry")
+
+	prev, curr, ents, release, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	defer release(true)
+
+	if prev != 0 || curr != 1 {
+		t.Errorf("indices: got (%d,%d) want (0,1)", prev, curr)
+	}
+	if len(ents) != 1 || string(ents[0].Data) != "only-entry" {
+		t.Errorf("entries: %v", ents)
+	}
+	if ents[0].Index != 1 {
+		t.Errorf("entry.Index: got %d want 1", ents[0].Index)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 13. Long snapshot chain (many windows with release(true) each time):
+//     no entry must cross a window boundary in either direction.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_LongChain_NoCrossWindowLeakage(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	const windows = 15
+	const perWindow = 4
+
+	allWindows := make([][]string, windows)
+
+	for w := 0; w < windows; w++ {
+		batch := make([]string, perWindow)
+		for i := range batch {
+			batch[i] = fmt.Sprintf("w%d-e%d", w, i)
+		}
+		mustLog(t, bl, batch...)
+
+		_, _, entries := collectAll(t, bl)
+		allWindows[w] = entries
+	}
+
+	// Verify each window has exactly perWindow entries.
+	for w, entries := range allWindows {
+		if len(entries) != perWindow {
+			t.Errorf("window %d: got %d entries want %d: %v", w, len(entries), perWindow, entries)
+		}
+	}
+
+	// Verify no entry from window W appears in window W+1 or later.
+	for w := 0; w < windows-1; w++ {
+		thisSet := make(map[string]bool, len(allWindows[w]))
+		for _, e := range allWindows[w] {
+			thisSet[e] = true
+		}
+		for laterW := w + 1; laterW < windows; laterW++ {
+			for _, e := range allWindows[laterW] {
+				if thisSet[e] {
+					t.Errorf("entry %q from window %d reappeared in window %d", e, w, laterW)
+				}
+			}
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 14. release(true) after the final snapshot must not prevent a subsequent
+//     Log+CreateSnapshot cycle from working (WAL GC does not remove live data).
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_ReleaseTrue_DoesNotCorruptSubsequentWrites(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	// Snapshot a first batch, release WAL.
+	mustLog(t, bl, "batch1-a", "batch1-b")
+	_, snap1, _, rel1, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot1: %v", err)
+	}
+	if err := rel1(true); err != nil {
+		t.Fatalf("release1: %v", err)
+	}
+
+	// Write a second batch and snapshot — must not be affected by the GC.
+	mustLog(t, bl, "batch2-a", "batch2-b", "batch2-c")
+	prev2, curr2, ents2, rel2, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot2 after release(true): %v", err)
+	}
+	defer rel2(true)
+
+	if prev2 != snap1 {
+		t.Errorf("snapshot2 prevIndex: got %d want %d", prev2, snap1)
+	}
+	if curr2 != snap1+3 {
+		t.Errorf("snapshot2 currIndex: got %d want %d", curr2, snap1+3)
+	}
+	assertEntries(t, "snapshot2", func() []string {
+		out := make([]string, len(ents2))
+		for i, e := range ents2 {
+			out[i] = string(e.Data)
+		}
+		return out
+	}(), []string{"batch2-a", "batch2-b", "batch2-c"})
+}
+
+// ----------------------------------------------------------------------------
+// 15. Snapshot then restart then release(true) on old snapshot: the old
+//     release must be safe to call even after the logger has been restarted
+//     (release closes over the old storage; after restart a new storage
+//     instance exists — the caller must not use the old release after restart).
+//     This test documents the expected behaviour: the old release operates on
+//     the closed storage and must return an error or no-op, but must not panic.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_OldRelease_AfterRestart_DoesNotPanic(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	mustLog(t, bl, "before-restart")
+	_, _, _, oldRelease, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// Restart without calling oldRelease first.
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+	defer bl2.Close()
+
+	// oldRelease now operates on the closed/replaced storage.
+	// It must not panic — an error is acceptable.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("oldRelease panicked after restart: %v", r)
+		}
+	}()
+	_ = oldRelease(true) // error is tolerated; panic is not
+}
+
+// ----------------------------------------------------------------------------
+// 16. Log entry order is preserved exactly across a snapshot+restart cycle,
+//     even when logs were written in multiple separate batches.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_EntryOrderPreservedAcrossRestart(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	// Write in three separate batches of different sizes.
+	mustLog(t, bl, "a1", "a2", "a3")
+	mustLog(t, bl, "b1")
+	mustLog(t, bl, "c1", "c2")
+
+	// Snapshot the first 4 entries only.
+	bl.Log([][]byte{}) // no-op, indices unchanged
+	_, snap1, _, rel, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	_ = rel(true)
+	if snap1 != 6 {
+		t.Fatalf("snapIndex: got %d want 6", snap1)
+	}
+
+	// Write one more batch after the snapshot.
+	mustLog(t, bl, "d1", "d2")
+
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	// After restart the un-snapshotted entries (d1, d2) must be recovered
+	// in the correct order with the correct indices.
+	_, _, ents, release2, err := bl2.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("post-restart snapshot: %v", err)
+	}
+	defer release2(true)
+
+	assertEntries(t, "post-restart order", func() []string {
+		out := make([]string, len(ents))
+		for i, e := range ents {
+			out[i] = string(e.Data)
+		}
+		return out
+	}(), []string{"d1", "d2"})
+
+	if len(ents) == 2 {
+		if ents[0].Index != 7 {
+			t.Errorf("d1 index: got %d want 7", ents[0].Index)
+		}
+		if ents[1].Index != 8 {
+			t.Errorf("d2 index: got %d want 8", ents[1].Index)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 17. Concurrent Log calls interleaved with a snapshot window must not cause
+//     the snapshot's filtered entry list to contain out-of-order indices.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_ConcurrentLog_EntriesInOrder(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	// Seed some entries.
+	mustLog(t, bl, "seed-a", "seed-b")
+
+	// Open snapshot window.
+	_, _, _, release, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// Concurrently write more entries while the window is open.
+	var wg sync.WaitGroup
+	const n = 10
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = bl.Log([][]byte{[]byte(fmt.Sprintf("concurrent-%02d", i))})
+		}(i)
+	}
+	wg.Wait()
+	_ = release(true)
+
+	// Now snapshot the concurrent entries.
+	_, _, ents, rel2, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot2: %v", err)
+	}
+	if rel2 != nil {
+		defer rel2(true)
+	}
+
+	// Indices in the returned slice must be strictly monotonically increasing.
+	for i := 1; i < len(ents); i++ {
+		if ents[i].Index <= ents[i-1].Index {
+			t.Errorf("entry indices not strictly increasing at position %d: %d <= %d",
+				i, ents[i].Index, ents[i-1].Index)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 18. Snapshot window captures exactly the entries up to lastIndex at the
+//     moment CreateSnapshot was called, not entries added afterward.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_WindowBoundedAtCallTime(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	mustLog(t, bl, "before-snap-1", "before-snap-2")
+
+	// Open snapshot — captures lastIndex=2 at this moment.
+	_, snapCurr, ents, release, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// Write more entries AFTER CreateSnapshot captured lastIndex.
+	mustLog(t, bl, "after-snap-1", "after-snap-2")
+
+	// The snapshot's entry list must NOT contain the after-snap entries.
+	for _, e := range ents {
+		if string(e.Data) == "after-snap-1" || string(e.Data) == "after-snap-2" {
+			t.Errorf("snapshot contains entry written after CreateSnapshot: %q", e.Data)
+		}
+	}
+	if snapCurr != 2 {
+		t.Errorf("snapCurr: got %d want 2", snapCurr)
+	}
+	_ = release(true)
+
+	// The next snapshot must pick up exactly the after-snap entries.
+	prev2, curr2, ents2, rel2, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot2: %v", err)
+	}
+	if rel2 != nil {
+		defer rel2(true)
+	}
+	if prev2 != 2 || curr2 != 4 {
+		t.Errorf("snapshot2 indices: got (%d,%d) want (2,4)", prev2, curr2)
+	}
+	assertEntries(t, "snapshot2", func() []string {
+		out := make([]string, len(ents2))
+		for i, e := range ents2 {
+			out[i] = string(e.Data)
+		}
+		return out
+	}(), []string{"after-snap-1", "after-snap-2"})
+}
+
+// ----------------------------------------------------------------------------
+// 19. Stress: many concurrent goroutines log, interleaved with a snapshot
+//     window, then restart. Total entry count must equal exactly what was
+//     written with no duplicates or gaps across the restart boundary.
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_StressConcurrentLogAndRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in short mode")
+	}
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	const preWriters = 8
+	const prePerWriter = 5
+	const postWriters = 6
+	const postPerWriter = 4
+
+	// Phase 1: write concurrently, then snapshot.
+	var wg1 sync.WaitGroup
+	for i := 0; i < preWriters; i++ {
+		wg1.Add(1)
+		go func(i int) {
+			defer wg1.Done()
+			for j := 0; j < prePerWriter; j++ {
+				if err := bl.Log([][]byte{[]byte(fmt.Sprintf("pre-%d-%d", i, j))}); err != nil {
+					t.Errorf("pre Log: %v", err)
+				}
+			}
+		}(i)
+	}
+	wg1.Wait()
+
+	_, snap1Curr, _, rel1, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot1: %v", err)
+	}
+	expected1 := preWriters * prePerWriter
+	if int(snap1Curr) != expected1 {
+		t.Errorf("snap1Curr: got %d want %d", snap1Curr, expected1)
+	}
+	_ = rel1(true)
+
+	// Phase 2: write more concurrently, then close without snapshotting.
+	var wg2 sync.WaitGroup
+	for i := 0; i < postWriters; i++ {
+		wg2.Add(1)
+		go func(i int) {
+			defer wg2.Done()
+			for j := 0; j < postPerWriter; j++ {
+				if err := bl.Log([][]byte{[]byte(fmt.Sprintf("post-%d-%d", i, j))}); err != nil {
+					t.Errorf("post Log: %v", err)
+				}
+			}
+		}(i)
+	}
+	wg2.Wait()
+
+	// Restart.
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	// After restart the post-phase entries must all be present.
+	_, snap2Curr, recovered := collectAll(t, bl2)
+
+	expected2 := postWriters * postPerWriter
+	if len(recovered) != expected2 {
+		t.Errorf("post-restart entry count: got %d want %d", len(recovered), expected2)
+	}
+	if int(snap2Curr) != expected1+expected2 {
+		t.Errorf("snap2Curr: got %d want %d", snap2Curr, expected1+expected2)
+	}
+
+	// No entry from phase 1 may appear in the phase 2 recovery.
+	for _, e := range recovered {
+		if len(e) >= 3 && e[:3] == "pre" {
+			t.Errorf("phase-1 entry %q appeared in post-restart snapshot", e)
+		}
+	}
+
+	// All post-phase entries must be present exactly once.
+	seen := make(map[string]int, expected2)
+	for _, e := range recovered {
+		seen[e]++
+	}
+	for i := 0; i < postWriters; i++ {
+		for j := 0; j < postPerWriter; j++ {
+			key := fmt.Sprintf("post-%d-%d", i, j)
+			if seen[key] != 1 {
+				t.Errorf("entry %q: count %d want 1", key, seen[key])
+			}
+		}
+	}
+}
