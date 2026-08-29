@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 )
 
 var (
+	// ErrIndexOverflow is returned when the WAL entry index overflows uint64.
 	ErrIndexOverflow = fmt.Errorf("BinLogger index overflow")
 
 	raftpbHardState = raftpb.HardState{}
@@ -35,6 +37,10 @@ type BinLogger struct {
 	lastSnapIndex atomic.Uint64
 	snapshotter   *snap.Snapshotter
 	storage       storage.Storage
+
+	// closeOnce ensures Close is idempotent even when called concurrently
+	// (e.g. direct call and context-cancellation goroutine racing).
+	closeOnce sync.Once
 }
 
 func NewBinLogger(walDir, snapDir string, syncInterval time.Duration) *BinLogger {
@@ -47,6 +53,8 @@ func NewBinLogger(walDir, snapDir string, syncInterval time.Duration) *BinLogger
 
 func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 	bl.snapshotter = snap.New(zap.NewNop(), bl.snapDir)
+	// Reset closeOnce so a restarted BinLogger can be closed again.
+	bl.closeOnce = sync.Once{}
 
 	var w *wal.WAL
 	var err error
@@ -58,17 +66,35 @@ func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 
 		index := uint64(0)
 		if len(snaps) > 0 {
-			if !strings.HasSuffix(snaps[len(snaps)-1].Name(), ".snap") {
-				return fmt.Errorf("invalid latest snapshot file found at %s: %s", bl.snapDir, snaps[len(snaps)-1].Name())
+			// Filter to only .snap files and sort them numerically by index so
+			// that we always pick the highest-index snapshot regardless of
+			// term number (lexicographic order is wrong for multi-digit indices).
+			type snapEntry struct {
+				name  string
+				index uint64
+			}
+			var snapFiles []snapEntry
+			for _, s := range snaps {
+				if !strings.HasSuffix(s.Name(), ".snap") {
+					continue
+				}
+				parts := strings.Split(strings.TrimSuffix(s.Name(), ".snap"), "-")
+				if len(parts) != 2 {
+					return fmt.Errorf("invalid snapshot file name found at %s: %s", bl.snapDir, s.Name())
+				}
+				idx, parseErr := strconv.ParseUint(parts[1], 16, 64)
+				if parseErr != nil {
+					return fmt.Errorf("failed to parse snapshot file name %s: %v", s.Name(), parseErr)
+				}
+				snapFiles = append(snapFiles, snapEntry{name: s.Name(), index: idx})
 			}
 
-			parts := strings.Split(strings.TrimSuffix(snaps[len(snaps)-1].Name(), ".snap"), "-")
-			if len(parts) != 2 {
-				return fmt.Errorf("invalid latest snapshot file name found at %s: %s", bl.snapDir, snaps[len(snaps)-1].Name())
-			}
-
-			if index, err = strconv.ParseUint(parts[1], 10, 64); err != nil {
-				return fmt.Errorf("failed to parse snapshot file name %s: %v", snaps[len(snaps)-1].Name(), err)
+			if len(snapFiles) > 0 {
+				// Sort ascending by index; take the last (highest) one.
+				sort.Slice(snapFiles, func(i, j int) bool {
+					return snapFiles[i].index < snapFiles[j].index
+				})
+				index = snapFiles[len(snapFiles)-1].index
 			}
 		}
 
@@ -101,19 +127,18 @@ func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 
 	bl.storage = storage.NewStorage(zap.NewNop(), w, bl.snapshotter)
 
-	syncOnce := sync.Once{}
-	for _, w := range wg {
-		w.Add(1)
-		go func(w *sync.WaitGroup) {
-			defer w.Done()
+	for _, wg := range wg {
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
 			<-ctx.Done()
 
-			syncOnce.Do(func() {
-				if err := bl.Close(); err != nil {
-					println("Failed to close binlog at %s: %v", bl.walDir, err)
+			bl.closeOnce.Do(func() {
+				if err := bl.close(); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to close binlog at %s: %v\n", bl.walDir, err)
 				}
 			})
-		}(w)
+		}(wg)
 	}
 
 	if bl.syncInterval > 0 {
@@ -124,7 +149,7 @@ func (bl *BinLogger) Start(ctx context.Context, wg ...*sync.WaitGroup) error {
 				select {
 				case <-ticker.C:
 					if err := bl.storage.Sync(); err != nil {
-						println("Failed to sync binlog at %s: %v", bl.walDir, err)
+						fmt.Fprintf(os.Stderr, "Failed to sync binlog at %s: %v\n", bl.walDir, err)
 					}
 				case <-ctx.Done():
 					return
@@ -161,7 +186,7 @@ func (bl *BinLogger) Log(data [][]byte) error {
 
 	if bl.syncInterval == 0 {
 		if err := bl.storage.Sync(); err != nil {
-			return fmt.Errorf("failed to sync WAL after snapshot: %v", err)
+			return fmt.Errorf("failed to sync WAL after log: %v", err)
 		}
 	}
 
@@ -174,7 +199,8 @@ func (bl *BinLogger) MustLog(data [][]byte) {
 	}
 }
 
-func (bl *BinLogger) Close() error {
+// close is the internal implementation; it is called at most once via closeOnce.
+func (bl *BinLogger) close() error {
 	if err := bl.storage.Sync(); err != nil {
 		return fmt.Errorf("failed to sync storage: %v", err)
 	}
@@ -184,6 +210,16 @@ func (bl *BinLogger) Close() error {
 	}
 
 	return nil
+}
+
+// Close syncs and closes the underlying WAL storage. It is safe to call
+// multiple times; subsequent calls are no-ops.
+func (bl *BinLogger) Close() error {
+	var closeErr error
+	bl.closeOnce.Do(func() {
+		closeErr = bl.close()
+	})
+	return closeErr
 }
 
 func (bl *BinLogger) CreateSnapshot() (uint64, uint64, []raftpb.Entry, func(bool) error, error) {
