@@ -586,3 +586,403 @@ func TestLog_LargePayload(t *testing.T) {
 		t.Errorf("unexpected entries after large payload log")
 	}
 }
+
+// ============================================================================
+// DATA INTEGRITY TESTS — focused on breaking snapshotting correctness
+// ============================================================================
+
+// collectAll drains the logger: creates a snapshot, collects the data strings
+// from all returned entries, calls release(true), and returns them. It does NOT
+// fatal if there are no entries; callers check the returned slice length.
+func collectAll(t *testing.T, bl *gobinlogger.BinLogger) (prev, curr uint64, data []string) {
+	t.Helper()
+	p, c, ents, rel, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	for _, e := range ents {
+		data = append(data, string(e.Data))
+	}
+	if rel != nil {
+		if err := rel(true); err != nil {
+			t.Fatalf("release(true): %v", err)
+		}
+	}
+	return p, c, data
+}
+
+// restartLogger closes bl, then opens a brand-new BinLogger against the same
+// directories and returns it. It registers Close via t.Cleanup.
+func restartLogger(t *testing.T, bl *gobinlogger.BinLogger, walDir, snapDir string) *gobinlogger.BinLogger {
+	t.Helper()
+	if err := bl.Close(); err != nil {
+		t.Fatalf("Close before restart: %v", err)
+	}
+	bl2 := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl2.Close() })
+	return bl2
+}
+
+// assertEntries checks that the collected data slice exactly matches want,
+// in order.
+func assertEntries(t *testing.T, label string, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("%s: entry count got %d want %d\n  got:  %v\n  want: %v", label, len(got), len(want), got, want)
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("%s: entry[%d] got %q want %q", label, i, got[i], want[i])
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 1. No entry must be skipped or duplicated across consecutive snapshot windows
+// ----------------------------------------------------------------------------
+
+// TestSnapshot_NoSkipNoDuplicate writes a long sequence of entries spread
+// across many snapshot/log cycles and verifies that every entry appears in
+// exactly one snapshot window, none are skipped, and none are doubled.
+func TestSnapshot_NoSkipNoDuplicate(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	const rounds = 10
+	const perRound = 7
+	seen := make(map[string]int) // value → count
+
+	for r := 0; r < rounds; r++ {
+		// Write a batch.
+		batch := make([]string, perRound)
+		for i := range batch {
+			batch[i] = fmt.Sprintf("round%d-entry%d", r, i)
+		}
+		mustLog(t, bl, batch...)
+
+		// Snapshot the batch.
+		_, _, entries := collectAll(t, bl)
+		for _, e := range entries {
+			seen[e]++
+		}
+	}
+
+	// Every entry must appear exactly once.
+	total := rounds * perRound
+	if len(seen) != total {
+		t.Errorf("unique entries seen: got %d want %d", len(seen), total)
+	}
+	for v, count := range seen {
+		if count != 1 {
+			t.Errorf("entry %q appeared %d times (want 1)", v, count)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 2. Entries written concurrently while a snapshot is open must not be lost
+//    after restart (the core data-loss race from the analysis)
+// ----------------------------------------------------------------------------
+
+// TestSnapshot_ConcurrentLog_NoDataLossAfterRestart starts a snapshot, then
+// concurrently writes new entries while the snapshot window is still open.
+// After release(true) and a restart, those concurrent entries must still be
+// recoverable in the next snapshot.
+func TestSnapshot_ConcurrentLog_NoDataLossAfterRestart(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	// Seed some entries so CreateSnapshot has something to work with.
+	mustLog(t, bl, "seed-1", "seed-2", "seed-3")
+
+	// Open the snapshot but do NOT call release yet.
+	prevIdx, snapIdx, ents, release, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if release == nil {
+		t.Fatal("expected non-nil release")
+	}
+	if prevIdx != 0 || snapIdx != 3 {
+		t.Errorf("seed snapshot indices: got (%d,%d) want (0,3)", prevIdx, snapIdx)
+	}
+	assertEntries(t, "seed snapshot", func() []string {
+		out := make([]string, len(ents))
+		for i, e := range ents {
+			out[i] = string(e.Data)
+		}
+		return out
+	}(), []string{"seed-1", "seed-2", "seed-3"})
+
+	// Concurrently write entries while the snapshot window is still open.
+	const concurrent = 5
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := bl.Log([][]byte{[]byte(fmt.Sprintf("concurrent-%d", i))}); err != nil {
+				t.Errorf("concurrent Log: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Now release the snapshot (triggers WAL GC for segments up to index 3).
+	if err := release(true); err != nil {
+		t.Fatalf("release(true): %v", err)
+	}
+
+	// Close and restart to force recovery from disk.
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	// The next snapshot must contain exactly the `concurrent` entries written
+	// after the seed snapshot. None must be missing.
+	_, _, recovered := collectAll(t, bl2)
+	if len(recovered) != concurrent {
+		t.Errorf("after restart: got %d entries want %d\n  entries: %v", len(recovered), concurrent, recovered)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 3. Snapshot boundary is exact: entries on the boundary index are not
+//    included in the next window (no off-by-one doubling on boundary)
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_BoundaryIndex_NoDoubling(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	mustLog(t, bl, "a", "b", "c") // indices 1,2,3
+	prev1, curr1, window1 := collectAll(t, bl)
+
+	if prev1 != 0 || curr1 != 3 {
+		t.Fatalf("window1 indices: got (%d,%d) want (0,3)", prev1, curr1)
+	}
+	assertEntries(t, "window1", window1, []string{"a", "b", "c"})
+
+	mustLog(t, bl, "d", "e") // indices 4,5
+	prev2, curr2, window2 := collectAll(t, bl)
+
+	if prev2 != 3 || curr2 != 5 {
+		t.Fatalf("window2 indices: got (%d,%d) want (3,5)", prev2, curr2)
+	}
+	assertEntries(t, "window2", window2, []string{"d", "e"})
+
+	// "c" must NOT appear in window2; "d" must NOT appear in window1.
+	for _, e := range window1 {
+		if e == "d" || e == "e" {
+			t.Errorf("window1 contains entry from window2: %q", e)
+		}
+	}
+	for _, e := range window2 {
+		if e == "a" || e == "b" || e == "c" {
+			t.Errorf("window2 contains entry from window1: %q", e)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 4. After release(false) the same entries must appear in the next snapshot
+//    (WAL not GC'd, no entries silently dropped)
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_ReleaseFalse_EntriesRetainedInNextSnapshot(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	mustLog(t, bl, "x", "y", "z")
+
+	// First snapshot: do NOT release WAL (ok=false).
+	prev1, curr1, ents1, rel1, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot1: %v", err)
+	}
+	if prev1 != 0 || curr1 != 3 {
+		t.Fatalf("snapshot1 indices: got (%d,%d) want (0,3)", prev1, curr1)
+	}
+	assertEntries(t, "snapshot1", func() []string {
+		out := make([]string, len(ents1))
+		for i, e := range ents1 {
+			out[i] = string(e.Data)
+		}
+		return out
+	}(), []string{"x", "y", "z"})
+
+	// release(false) — WAL not GC'd.
+	if err := rel1(false); err != nil {
+		t.Fatalf("release(false): %v", err)
+	}
+
+	// Write more entries.
+	mustLog(t, bl, "p", "q")
+
+	// Second snapshot: must only contain the new entries (x,y,z already
+	// committed to lastSnapIndex=3; they must NOT reappear).
+	prev2, curr2, window2 := collectAll(t, bl)
+
+	if prev2 != 3 || curr2 != 5 {
+		t.Fatalf("snapshot2 indices: got (%d,%d) want (3,5)", prev2, curr2)
+	}
+	assertEntries(t, "snapshot2", window2, []string{"p", "q"})
+
+	for _, e := range window2 {
+		if e == "x" || e == "y" || e == "z" {
+			t.Errorf("snapshot2 contains already-snapshotted entry: %q", e)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 5. Full restart integrity: every entry logged before Close must be
+//    recoverable via CreateSnapshot after restart, with correct indices
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_RestartRecovery_CompleteIntegrity(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	// Phase 1: log and snapshot some entries, then log more without snapshotting.
+	mustLog(t, bl, "e1", "e2", "e3")
+	_, _, _ = collectAll(t, bl) // snapshot indices 0→3, release(true)
+
+	mustLog(t, bl, "e4", "e5") // not yet snapshotted
+	mustLog(t, bl, "e6")       // also not snapshotted
+
+	// Restart without snapshotting e4/e5/e6.
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	mustLog(t, bl2, "e7", "e8") // written post-restart
+
+	// Now snapshot. Must recover e4..e8.
+	prev, curr, recovered := collectAll(t, bl2)
+
+	if prev != 3 {
+		t.Errorf("prevSnapIndex after restart: got %d want 3", prev)
+	}
+	if curr != 8 {
+		t.Errorf("currSnapIndex after restart: got %d want 8", curr)
+	}
+	assertEntries(t, "post-restart snapshot", recovered, []string{"e4", "e5", "e6", "e7", "e8"})
+}
+
+// ----------------------------------------------------------------------------
+// 6. snapshotMutex prevents two concurrent CreateSnapshot calls from racing:
+//    the second must block until release() is called on the first
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_MutexBlocksConcurrentSnapshot(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+	t.Cleanup(func() { bl.Close() })
+
+	mustLog(t, bl, "alpha", "beta")
+
+	// Start the first snapshot; hold the release.
+	_, _, _, release1, err := bl.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot1: %v", err)
+	}
+
+	// Attempt a second snapshot in a goroutine; it must block.
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		close(started)
+		_, _, _, rel2, err := bl.CreateSnapshot()
+		if err != nil {
+			t.Errorf("snapshot2: %v", err)
+		}
+		if rel2 != nil {
+			_ = rel2(true)
+		}
+		close(finished)
+	}()
+
+	<-started
+	// Give the goroutine time to block on snapshotMutex.
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-finished:
+		t.Error("second CreateSnapshot returned before first release() was called")
+	default:
+		// expected: still blocked
+	}
+
+	// Release the first snapshot; the second should now unblock.
+	if err := release1(true); err != nil {
+		t.Fatalf("release1(true): %v", err)
+	}
+
+	select {
+	case <-finished:
+		// expected
+	case <-time.After(3 * time.Second):
+		t.Fatal("second CreateSnapshot never unblocked after release()")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// 7. Snapshot index stored in lastSnapIndex must match what is recovered
+//    on restart (snapshot file and WAL must be consistent)
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_IndexConsistencyAcrossRestart(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	mustLog(t, bl, "r1", "r2", "r3", "r4", "r5")
+
+	prev, curr, _ := collectAll(t, bl) // snapshot 0→5
+	if prev != 0 || curr != 5 {
+		t.Fatalf("snapshot indices: got (%d,%d) want (0,5)", prev, curr)
+	}
+
+	mustLog(t, bl, "r6") // un-snapshotted
+
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	// After restart, lastSnapIndex must be 5 (the last committed snapshot).
+	// CreateSnapshot must pick up only r6.
+	prev2, curr2, entries := collectAll(t, bl2)
+	if prev2 != 5 {
+		t.Errorf("prevSnapIndex after restart: got %d want 5", prev2)
+	}
+	if curr2 != 6 {
+		t.Errorf("currSnapIndex after restart: got %d want 6", curr2)
+	}
+	assertEntries(t, "post-restart", entries, []string{"r6"})
+}
+
+// ----------------------------------------------------------------------------
+// 8. Entries at the exact snapshot boundary index are not double-counted
+//    across restart (fence-post check at prevSnapIndex boundary)
+// ----------------------------------------------------------------------------
+
+func TestSnapshot_FencePost_BoundaryEntryNotDoubled(t *testing.T) {
+	walDir, snapDir := setupDirs(t)
+	bl := newStarted(t, walDir, snapDir)
+
+	mustLog(t, bl, "fence-1", "fence-2") // indices 1,2
+	_, curr, _ := collectAll(t, bl)      // snapshot 0→2
+	if curr != 2 {
+		t.Fatalf("snapshot curr: got %d want 2", curr)
+	}
+
+	// No more writes; restart.
+	bl2 := restartLogger(t, bl, walDir, snapDir)
+
+	// CreateSnapshot must be a no-op (no new entries since last snapshot).
+	prevN, currN, ents, rel, err := bl2.CreateSnapshot()
+	if err != nil {
+		t.Fatalf("no-op snapshot after restart: %v", err)
+	}
+	if ents != nil || rel != nil {
+		t.Errorf("expected no-op snapshot; got prevN=%d currN=%d entries=%v", prevN, currN, ents)
+	}
+}
