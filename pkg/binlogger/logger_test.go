@@ -1,3 +1,4 @@
+//nolint:errcheck
 package gobinlogger_test
 
 import (
